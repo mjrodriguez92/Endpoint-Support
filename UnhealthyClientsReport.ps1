@@ -12,91 +12,138 @@ Version 1.0:  Original published version.
 
 <#
 .SYNOPSIS
-Retreives a list of all unhealthy endpoints from Microsoft Intune.
+Compiles a Windows 11 readiness data from MS Graph (Intune).
 
 .DESCRIPTION
-This script retreives all the requested data for unhealthy endpoints via an Azure automation runbook powershell script. 
-This script will export a list of unhealthy Intune endpoints and email a csv of the report as an attactment to the listed
-recipient(s).
-resource rooms such as the resource names, allowed calendar conflicts, number of instances
-allowed, and percentage even.
+This script retreives all the relevant data for endpoints via MS Graph from the Intune Data Warehouse
+into Azure blob storage and this can be utilized for PowerBI Reporting.
+
+Module Requirements
+
+# Az.Accounts
+# Az.Storage
 
 #>
 
-# Set some variables
+# Variables
+$ResourceGroup = "<my-resource-group>" # Reource group that hosts the storage account
+$StorageAccount = "<my-storage-account>" # Storage account name
+$Container = "windows11readiness" # Container name
+$ExportLocation = "$env:TEMP"
 $ProgressPreference = 'SilentlyContinue'
-$EmailParams = @{
-    To         = 'recipient@contoso.com'
-    From       = 'azureautomation@contoso.onmicrosoft.com'
-    Smtpserver = 'contoso-com.mail.protection.outlook.com'
-    Port       = 25
+$VerbosePreference = 'Continue'
+
+
+# Graph web request function
+Function Invoke-MyGraphGetRequest {
+    Param ($URL)
+    try {
+            $WebRequest = Invoke-WebRequest -Uri $URL -Method GET -Headers $Headers -UseBasicParsing
+    }
+    catch {
+        $WebRequest = $_.Exception.Response
+    }
+    Return $WebRequest
 }
 
-# Obtain an access token for MS Graph as a Managed Identity
+
+# Authenticate
 $url = $env:IDENTITY_ENDPOINT  
 $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]" 
 $headers.Add("X-IDENTITY-HEADER", $env:IDENTITY_HEADER) 
 $headers.Add("Metadata", "True") 
 $body = @{resource='https://graph.microsoft.com/' } 
 $accessToken = (Invoke-RestMethod $url -Method 'POST' -Headers $headers -ContentType 'application/x-www-form-urlencoded' -Body $body ).access_token
-$authHeader = @{
+$script:Headers = @{
     'Authorization' = "Bearer $accessToken"
 }
 
-# Download data from MS Graph
-$URI = "https://graph.microsoft.com/beta/deviceManagement/manageddevices?`$filter=StartsWith(operatingSystem,'Windows')&`$select=deviceName,enrolledDateTime,lastSyncDateTime,managementAgent,deviceEnrollmentType,userPrincipalName,model,serialNumber,userDisplayName,configurationManagerClientEnabledFeatures,configurationManagerClientHealthState"
-$Response = Invoke-WebRequest -Uri $URI -Method Get -Headers $authHeader -UseBasicParsing 
+$null = Connect-AzAccount -Identity
+
+
+# Graph URI
+$URI = "https://graph.microsoft.com/beta/deviceManagement/userExperienceAnalyticsWorkFromAnywhereMetrics('allDevices')/metricDevices?`$select=id%2cdeviceName%2cosDescription%2cosVersion%2cupgradeEligibility%2cazureAdJoinType%2cupgradeEligibility%2cramCheckFailed%2cstorageCheckFailed%2cprocessorCoreCountCheckFailed%2cprocessorSpeedCheckFailed%2ctpmCheckFailed%2csecureBootCheckFailed%2cprocessorFamilyCheckFailed%2cprocessor64BitCheckFailed%2cosCheckFailed&dtFilter=all"
+
+# Get data from Graph with some error handling
+$Response = Invoke-MyGraphGetRequest -URL $URI 
+if ($Response.StatusCode -ne 200)
+{
+    Write-Warning "Graph request returned $($Response.StatusCode)). Retrying..."
+    Start-Sleep -Seconds 30
+    $RetryCount = 0
+    do {
+        $Response = Invoke-MyGraphGetRequest -URL $URI 
+        If ($Response.StatusCode -ne 200) 
+        {
+            Write-Warning "Graph request returned $($Response.StatusCode)). Retrying..."
+            $RetryCount ++
+            Start-Sleep -Seconds 30
+        }
+    }
+    Until ($Response.StatusCode -eq 200 -or $RetryCount -ge 10)
+    If ($RetryCount -ge 10)
+    {
+        Write-Error "Gave up waiting for a success response to the Graph request."
+        throw
+    }
+}
+
+# Loop through the nextLinks until all data is retrieved
 $JsonResponse = $Response.Content | ConvertFrom-Json
 $DeviceData = $JsonResponse.value
 If ($JsonResponse.'@odata.nextLink')
 {
     do {
         $URI = $JsonResponse.'@odata.nextLink'
-        $Response = Invoke-WebRequest -Uri $URI -Method Get -Headers $authHeader -UseBasicParsing 
+        $Response = Invoke-MyGraphGetRequest -URL $URI 
+        if ($Response.StatusCode -ne 200)
+        {
+            Write-Warning "Graph request returned $($Response.StatusCode)). Retrying..."
+            Start-Sleep -Seconds 60
+            $RetryCount = 0
+            do {
+                $Response = Invoke-MyGraphGetRequest -URL $URI 
+                If ($Response.StatusCode -ne 200) 
+                {
+                    Write-Warning "Graph request returned $($Response.StatusCode)). Retrying..."
+                    $RetryCount ++
+                    Start-Sleep -Seconds 60
+                }
+            }
+            Until ($Response.StatusCode -eq 200 -or $RetryCount -ge 10)
+            If ($RetryCount -ge 10)
+            {
+                Write-Error "Gave up waiting for a success response to the Graph request."
+                throw
+            }
+        }
         $JsonResponse = $Response.Content | ConvertFrom-Json
         $DeviceData += $JsonResponse.value
     } until ($null -eq $JsonResponse.'@odata.nextLink')
 }
 
-# Organise the data as we want it displayed
-$Devices = New-Object System.Collections.ArrayList
-foreach ($item in $DeviceData)
-{
+# Create a unique result set of Windows 10 devices
+$AllDevices = $DeviceData | where {$_.osVersion -like "10.0.*"}
+$Properties = ($AllDevices[0] | Get-Member -MemberType NoteProperty).Name
+$AllDevices = $AllDevices | Sort-Object -Property $Properties -Unique
+
+# output some numbers
+Write-Verbose "Total devices: $($AllDevices.count)"
+
+# Export to CSV
+$AllDevices | Export-CSV -Path "$ExportLocation\alldevices.csv" -NoTypeInformation -Force
+
+# Upload to blob storage
+$StorageAccount = Get-AzStorageAccount -Name $StorageAccount -ResourceGroupName $ResourceGroup
+@(
+    "alldevices.csv"    
+) | foreach {
     try {
-        [void]$Devices.Add(
-            [PSCustomObject]@{
-                deviceName = $item.deviceName
-                enrolledDateTime = $item.enrolledDateTime
-                daysEnrolled = [math]::Round(((Get-Date) - ($item.enrolledDateTime | Get-Date -ErrorAction SilentlyContinue)).TotalDays,0)
-                lastSyncDateTime = $item.lastSyncDateTime
-                daysSinceLastSync = [math]::Round(((Get-Date) - ($item.lastSyncDateTime | Get-Date -ErrorAction SilentlyContinue)).TotalDays,0)
-                managementAgent = $item.managementAgent
-                deviceEnrollmentType = $item.deviceEnrollmentType
-                userPrincipalName = $item.userPrincipalName
-                model = $item.model
-                serialNumber = $item.serialNumber
-                userDisplayName = $item.userDisplayName
-                memcmEnabledFeature_inventory = $item.configurationManagerClientEnabledFeatures.inventory
-                memcmEnabledFeature_modernApps = $item.configurationManagerClientEnabledFeatures.modernApps
-                memcmEnabledFeature_resourceAccess = $item.configurationManagerClientEnabledFeatures.resourceAccess
-                memcmEnabledFeature_deviceConfiguration = $item.configurationManagerClientEnabledFeatures.deviceConfiguration 
-                memcmEnabledFeature_compliancePolicy = $item.configurationManagerClientEnabledFeatures.compliancePolicy
-                memcmEnabledFeature_windowsUpdateForBusiness = $item.configurationManagerClientEnabledFeatures.windowsUpdateForBusiness
-                memcmEnabledFeature_endpointProtection = $item.configurationManagerClientEnabledFeatures.endpointProtection
-                memcmEnabledFeature_officeApps = $item.configurationManagerClientEnabledFeatures.officeApps
-                memcmClientHealth_state = $item.configurationManagerClientHealthState.state
-                memcmClientHealth_errorCode = $item.configurationManagerClientHealthState.errorCode
-                memcmClientHealth_lastSyncDateTime = $item.configurationManagerClientHealthState.lastSyncDateTime
-                memcmClientHealth_daysSinceLastSync = [math]::Round(((Get-Date) - ($item.configurationManagerClientHealthState.lastSyncDateTime | Get-Date -ErrorAction SilentlyContinue)).TotalDays,0)
-            }
-        )
+        $FileName = $_
+        Write-Verbose "Uploading $FileName to Azure storage container $Container"
+        $null = Set-AzStorageBlobContent -File "$ExportLocation\$FileName" -Container $Container -Blob $FileName -Context $StorageAccount.Context -Force -ErrorAction Stop
     }
-    catch {} 
+    catch {
+        Write-Error -Exception $_ -Message "Failed to upload $FileName to blob storage"
+    } 
 }
-
-# Filter and export just the unhealthy clients - those that have talked to Intune but haven't talked to MEMCM in the last 7 days 
-$UnhealthyMEMCMClients = $Devices | where {$_.memcmClientHealth_state -ne 'healthy' -and $_.daysSinceLastSync -le 7 -and $_.memcmClientHealth_daysSinceLastSync -gt 7}
-$UnhealthyMEMCMClients | export-csv -Path $env:temp\UnhealthyMEMCMClients.csv -Force -NoTypeInformation 
-
-# Send the email
-Send-MailMessage @EmailParams -Subject "[Azure Automation] Unhealthy MEMCM Clients in Intune ($($UnhealthyMEMCMClients.Count))" -Attachments "$env:temp\UnhealthyMEMCMClients.csv"
