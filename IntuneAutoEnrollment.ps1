@@ -14,7 +14,7 @@ function Start-ServiceAndWait($serviceName) {
 function Set-ServiceStartupTypeAuto($serviceName) {
     $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
     if ($service) {
-        $currentStartType = (Get-Service -Name = $serviceName)
+        $currentStartType = (Get-Service $serviceName)
         if ($currentStartType -ne "Automatic") {
             Write-Host "Setting $serviceName to Automatic"
             Set-Service -Name $serviceName -StartupType Automatic
